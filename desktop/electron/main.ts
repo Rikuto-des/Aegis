@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -46,6 +46,19 @@ function registerIpcHandlers() {
 
     if (result.canceled || !result.filePath) return null
     return result.filePath
+  })
+
+  ipcMain.handle('aegis:showItemInFolder', async (_event, args: { filePath: string }) => {
+    if (!args?.filePath) return false
+    shell.showItemInFolder(args.filePath)
+    return true
+  })
+
+  ipcMain.handle('aegis:openPath', async (_event, args: { path: string }) => {
+    if (!args?.path) return { ok: false, error: 'path is required' }
+    const res = await shell.openPath(args.path)
+    if (res) return { ok: false, error: res }
+    return { ok: true }
   })
 
   ipcMain.handle(
