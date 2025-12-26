@@ -16,16 +16,18 @@ class AegisEngine:
         # Load models for adversarial attacks
         # Note: In a real implementation, you'd load specific models for Nightshade attacks
         # For now, we'll use Stable Diffusion as a base for our demonstrations
-        try:
-            self.pipeline = StableDiffusionPipeline.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                safety_checker=None,
-                requires_safety_checker=False
-            ).to(self.device)
-        except Exception as e:
-            print(f"Warning: Could not load Stable Diffusion model: {e}")
-            self.pipeline = None
+        self.pipeline = None
+        if os.getenv("AEGIS_LOAD_SD") == "1":
+            try:
+                self.pipeline = StableDiffusionPipeline.from_pretrained(
+                    "runwayml/stable-diffusion-v1-5",
+                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                    safety_checker=None,
+                    requires_safety_checker=False
+                ).to(self.device)
+            except Exception as e:
+                print(f"Warning: Could not load Stable Diffusion model: {e}")
+                self.pipeline = None
     
     def add_nightshade_noise(self, image_path, strength=0.1, target_class="random"):
         """
@@ -85,7 +87,7 @@ class AegisEngine:
         original_size = image.size
         
         # Convert to numpy array
-        img_array = np.array(image)
+        img_array = np.array(image).astype(np.float32)
         
         # Add high-frequency patterns that confuse VAEs
         # This is a simplified version - real implementation would be more sophisticated
@@ -97,7 +99,7 @@ class AegisEngine:
             for j in range(0, w, grid_size):
                 # Add subtle pattern variations
                 if (i // grid_size + j // grid_size) % 2 == 0:
-                    img_array[i:i+grid_size, j:j+grid_size] += np.random.randn(grid_size, grid_size, 3) * strength * 10
+                    img_array[i:i+grid_size, j:j+grid_size] += (np.random.randn(grid_size, grid_size, 3).astype(np.float32) * strength * 10)
         
         # Clamp values
         img_array = np.clip(img_array, 0, 255).astype(np.uint8)
