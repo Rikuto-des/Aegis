@@ -5,6 +5,10 @@ from diffusers import StableDiffusionPipeline
 import argparse
 import os
 import json
+import sys
+import io
+import traceback
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 
 class AegisEngine:
@@ -209,16 +213,81 @@ class AegisEngine:
             "timestamp": datetime.now().isoformat()
         }
 
+def run_daemon():
+    engine = AegisEngine()
+
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+
+        try:
+            req = json.loads(line)
+        except Exception as e:
+            resp = {"ok": False, "error": f"invalid_json: {e}"}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+            continue
+
+        req_id = req.get("id")
+        req_type = req.get("type")
+        if req_type == "ping":
+            sys.stdout.write(json.dumps({"ok": True, "type": "pong", "id": req_id}) + "\n")
+            sys.stdout.flush()
+            continue
+
+        if req_type == "process":
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            try:
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    result = engine.process_image(
+                        req["inputPath"],
+                        req["outputPath"],
+                        int(req.get("level", 2)),
+                    )
+                resp = {
+                    "ok": True,
+                    "id": req_id,
+                    "result": result,
+                    "stdout": out_buf.getvalue(),
+                    "stderr": err_buf.getvalue(),
+                }
+            except Exception as e:
+                resp = {
+                    "ok": False,
+                    "id": req_id,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "stdout": out_buf.getvalue(),
+                    "stderr": err_buf.getvalue(),
+                }
+
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+            continue
+
+        sys.stdout.write(json.dumps({"ok": False, "id": req_id, "error": f"unknown_type: {req_type}"}) + "\n")
+        sys.stdout.flush()
+
 def main():
     parser = argparse.ArgumentParser(description="Aegis AI Defense Engine")
-    parser.add_argument("--input", required=True, help="Input image path")
-    parser.add_argument("--output", required=True, help="Output image path")
+    parser.add_argument("--daemon", action="store_true", help="Run as a long-lived JSON-over-stdio daemon")
+    parser.add_argument("--input", required=False, help="Input image path")
+    parser.add_argument("--output", required=False, help="Output image path")
     parser.add_argument("--level", type=int, choices=[1, 2, 3], default=2, 
                        help="Defense level: 1=Stealth, 2=Shield, 3=Nightshade")
     parser.add_argument("--mode", choices=["nightshade", "i2i", "metadata", "full"], 
                        default="full", help="Processing mode")
     
     args = parser.parse_args()
+
+    if args.daemon:
+        run_daemon()
+        return
+
+    if not args.input or not args.output:
+        raise SystemExit("--input and --output are required unless --daemon is set")
     
     # Initialize engine
     engine = AegisEngine()

@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -24,6 +25,79 @@ export const RENDERER_DIST = path.join(process.env.APP_ROOT, 'dist')
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path.join(process.env.APP_ROOT, 'public') : RENDERER_DIST
 
 let win: BrowserWindow | null
+
+type DaemonResponse = {
+  ok: boolean
+  id?: string
+  stdout?: string
+  stderr?: string
+  result?: unknown
+  error?: string
+  traceback?: string
+}
+
+let daemonProc: ReturnType<typeof spawn> | null = null
+let daemonStdoutBuf = ''
+const pending = new Map<string, { resolve: (v: DaemonResponse) => void; reject: (e: Error) => void }>()
+
+function getDaemon(backendDir: string, scriptPath: string, pythonCmd: string) {
+  if (daemonProc && !daemonProc.killed) return daemonProc
+
+  daemonProc = spawn(pythonCmd, [scriptPath, '--daemon'], {
+    cwd: backendDir,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+    },
+  })
+
+  daemonStdoutBuf = ''
+
+  const proc = daemonProc
+  if (!proc.stdout || !proc.stderr || !proc.stdin) {
+    throw new Error('python daemon stdio is not available')
+  }
+
+  proc.stdout.on('data', (d) => {
+    daemonStdoutBuf += d.toString()
+    while (true) {
+      const idx = daemonStdoutBuf.indexOf('\n')
+      if (idx === -1) break
+      const line = daemonStdoutBuf.slice(0, idx).trim()
+      daemonStdoutBuf = daemonStdoutBuf.slice(idx + 1)
+      if (!line) continue
+
+      let msg: DaemonResponse
+      try {
+        msg = JSON.parse(line) as DaemonResponse
+      } catch {
+        continue
+      }
+
+      const id = msg.id
+      if (!id) continue
+      const p = pending.get(id)
+      if (!p) continue
+      pending.delete(id)
+      p.resolve(msg)
+    }
+  })
+
+  proc.stderr.on('data', (d) => {
+    // daemon自体のstderrは、個別のreq stderrとは別（必要なら後でログ転送する）
+    void d
+  })
+
+  proc.on('close', (code) => {
+    const err = new Error(`python daemon exited (code=${code})`)
+    for (const [, p] of pending) p.reject(err)
+    pending.clear()
+    daemonProc = null
+  })
+
+  return daemonProc
+}
 
 function registerIpcHandlers() {
   ipcMain.handle('aegis:selectInputImage', async () => {
@@ -74,43 +148,35 @@ function registerIpcHandlers() {
       const venvPython = path.join(backendDir, 'venv', 'bin', 'python')
 
       const pythonCmd = venvPython
-      const cliArgs = [
-        scriptPath,
-        '--input',
-        args.inputPath,
-        '--output',
-        args.outputPath,
-        '--level',
-        String(args.level),
-        '--mode',
-        'full',
-      ]
+      const proc = getDaemon(backendDir, scriptPath, pythonCmd)
 
-      return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-        const child = spawn(pythonCmd, cliArgs, {
-          cwd: backendDir,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
+      const id = randomUUID()
+      const payload = {
+        id,
+        type: 'process',
+        inputPath: args.inputPath,
+        outputPath: args.outputPath,
+        level: args.level,
+      }
 
-        let stdout = ''
-        let stderr = ''
-
-        child.stdout.on('data', (d) => {
-          stdout += d.toString()
-        })
-        child.stderr.on('data', (d) => {
-          stderr += d.toString()
-        })
-
-        child.on('error', (err) => reject(err))
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ stdout, stderr })
-          } else {
-            reject(new Error(`aegis_engine.py failed (code=${code})\n${stderr || stdout}`))
-          }
-        })
+      const resp = await new Promise<DaemonResponse>((resolve, reject) => {
+        pending.set(id, { resolve, reject })
+        if (!proc.stdin) {
+          pending.delete(id)
+          reject(new Error('python daemon stdin is not available'))
+          return
+        }
+        proc.stdin.write(JSON.stringify(payload) + '\n')
       })
+
+      if (!resp.ok) {
+        throw new Error(resp.error || resp.traceback || 'daemon error')
+      }
+
+      return {
+        stdout: resp.stdout ?? '',
+        stderr: resp.stderr ?? '',
+      }
     },
   )
 }
@@ -156,3 +222,10 @@ app.on('activate', () => {
 
 app.whenReady().then(createWindow)
 app.whenReady().then(registerIpcHandlers)
+
+app.on('before-quit', () => {
+  if (daemonProc && !daemonProc.killed) {
+    daemonProc.kill()
+    daemonProc = null
+  }
+})
